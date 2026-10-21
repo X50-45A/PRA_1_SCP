@@ -19,9 +19,6 @@ abstract class MapReduceConc extends MapReduce
     private int NThreads;
 
     private int ProcessedFiles =0;
-    public static long TotalWords = 0;
-    public static long DifferentWords = 0;
-    public static AtomicInteger MappersRunning = new AtomicInteger(0);
 
     public int getProcessedFiles() { return ProcessedFiles; }
     public void incProcessedFiles() { ProcessedFiles++; }
@@ -99,7 +96,7 @@ abstract class MapReduceConc extends MapReduce
     }
 
     // Procesa los ficheros de entrada para generar los diferentes split y posteriormente crea un mapper para procesarlos
-    // Versión secuencial: asume que un único Map va a procesar todos los splits.
+    // Versión Conc: asume que cada Map va a procesar un split.
     private Error Split(String inputDir)
     {
         Error cod;
@@ -107,27 +104,21 @@ abstract class MapReduceConc extends MapReduce
         // Process input files
         cod = ProcessInputFiles(inputDir);
 
-        // Create only one Mapper and assign all input splits
         if (cod==Error.COk)
         {
-            // Create new mapper
-            Map mapper = new Map(this);
-            AddMapper(mapper);
-
-            // Assigna all splits to the mapper
-            for(Split split : Splits)
-                mapper.addInputSplit(split.getInput());
+            for (Split split : Splits) {
+                Map mapper = new Map(this, split);
+                AddMapper(mapper);
+            }
         }
         return cod;
     }
 
     // Genera y lee diferentes splits: 1 split por fichero. Genera un vector con todos los splits generados.
+    //Cambios a la version Concurrente: --> Se hace que cada Split tenga su arhivo, en la version secuencial se va añadiendo to en el mismo SPLIT.
     private Error ProcessInputFiles(String input)
     {
         File folder = new File(input);
-
-        Split split = new Split();
-        AddSplit(split);
 
         if (folder.isDirectory())
         {
@@ -138,24 +129,37 @@ abstract class MapReduceConc extends MapReduce
             {
                 if (listOfFiles[i].isFile())
                 {
+                    Split split = new Split();
+                    AddSplit(split);
+
                     System.out.println("Processing input file " + listOfFiles[i].getName() + ".");
+
                     incProcessedFiles();
                     split.ReadFileTuples(listOfFiles[i].getAbsolutePath());
+                    split.AddInput(new MapInputTuple(-1, ""));
                 }
                 else if (listOfFiles[i].isDirectory()) {
                     System.out.println("Directory " + listOfFiles[i].getName());
-                    return ProcessInputFiles(listOfFiles[i].getName());
+
+                    Error result = ProcessInputFiles(listOfFiles[i].getAbsolutePath());
+                    if (result != Error.COk) {
+                        return result;
+                    }
                 }
             }
         }
-        else
+        else //creacion si el split es solo un archivo
         {
+            Split split = new Split();
+            AddSplit(split);
+
             System.out.println("Processing input file " + folder.getName() + ".");
             incProcessedFiles();
+
             split.ReadFileTuples(folder.getAbsolutePath());
+            split.AddInput(new MapInputTuple(-1, ""));
         }
 
-        split.AddInput(new MapInputTuple(-1, ""));
 
         return(Error.COk);
     }

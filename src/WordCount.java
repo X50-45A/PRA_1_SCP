@@ -25,7 +25,7 @@ public class WordCount
 
 		long startTime = System.nanoTime();
 	
-		WordCountMR wc = new WordCountMR(args[0], outputFiles, NRedurcers, NThreads);
+		WordCountMRConc wc = new WordCountMRConc(args[0], outputFiles, NRedurcers, NThreads);
 
 		wc.Run();
 
