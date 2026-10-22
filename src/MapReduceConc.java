@@ -4,6 +4,10 @@ import java.util.Vector;
 import java.io.IOException;
 import java.nio.file.*;
 import java.util.*;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
 
@@ -24,13 +28,13 @@ abstract class MapReduceConc extends MapReduce
     public void incProcessedFiles() { ProcessedFiles++; }
 
     private Vector<Split> Splits =  new Vector<Split>();
-    private Vector<Map> Mappers =  new Vector<Map>();
+    private Vector<MapConc> Mappers =  new Vector<MapConc>();
     private Vector<Reduce> Reducers =  new Vector<Reduce>();
 
 
     // Set and Gets
     private void AddSplit(Split split) { Splits.add(split); }
-    private void AddMapper(Map mapper) { Mappers.add(mapper); }
+    private void AddMapper(MapConc mapper) { Mappers.add(mapper); }
     private void AddReduce(Reduce reducer) { Reducers.add(reducer); }
     public void SetInputPath(String path) {
         InputPath = path;
@@ -75,6 +79,7 @@ abstract class MapReduceConc extends MapReduce
 
 
     // Procesa diferentes fases del framework mapreduc: split, map, suffle/merge, reduce.
+    @Override
     public Error Run()
     {
         if (Init()!=Error.COk)
@@ -107,7 +112,7 @@ abstract class MapReduceConc extends MapReduce
         if (cod==Error.COk)
         {
             for (Split split : Splits) {
-                Map mapper = new Map(this, split);
+                MapConc mapper = new MapConc(this, split);
                 AddMapper(mapper);
             }
         }
@@ -168,16 +173,61 @@ abstract class MapReduceConc extends MapReduce
     // Ejecuta cada uno de los Maps.
     private Error Maps()
     {
-        for(Map map : Mappers)
-        {
-            if (MapReduce.DEBUG) System.err.println("DEBUG::Running Map "+ map);
-            MappersRunning.incrementAndGet();
-            if (map.Run()!=Error.COk)
-                Error.showError("MapReduce::Map Run error.\n");
-            MappersRunning.decrementAndGet();
+        long totalWords = 0;
+        Error firstError = Error.COk;
+
+        ExecutorService pool = Executors.newFixedThreadPool(NThreads);
+        List<Future<Error>> pendiente = new ArrayList<>();
+        try {
+            for (MapConc map : Mappers) {
+                pendiente.add(pool.submit(() -> {
+                    if (MapReduce.DEBUG) {
+                        System.err.println("DEBUG::Running Map " + map);
+                    }
+
+                    MappersRunning.incrementAndGet();
+                    try {
+                        return map.Run();
+                    } finally {
+                        MappersRunning.decrementAndGet();
+                    }
+                }));
+            }
+
+            for (int i = 0; i < pendiente.size(); i++) {
+                try {
+                    Error result = pendiente.get(i).get(); // espera a que termine este Map
+
+                    totalWords += Mappers.get(i).getWordsEmitted();
+
+                    if (result != Error.COk && firstError == Error.COk) {
+                        firstError = result;
+                    }
+                } catch (ExecutionException e) {
+                    e.getCause().printStackTrace();
+                    if (firstError == Error.COk) {
+                        firstError = Error.CError;
+                    }
+                    // Sigue recogiendo las demás tareas antes de salir.
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    pool.shutdownNow();
+                    return Error.CError;
+                }
+            }
+
+            if (firstError != Error.COk) {
+                return firstError;
+            }
+
+            System.out.println("\nMappers han procesado un total de "
+                    + totalWords + " palabras.");
+
+            return Error.COk;
+
+        } finally {
+            pool.shutdown();
         }
-        System.out.println("\nMappers han procesado un total de "+TotalWords+" palabras.");
-        return(Error.COk);
     }
 
 
@@ -194,16 +244,16 @@ abstract class MapReduceConc extends MapReduce
     // Utiliza un multimap para realizar la ordenación/unión.
     private Error Suffle()
     {
-        for(Map map : Mappers)
+        for(MapConc map : Mappers)
         {
-            if (MapReduce.DEBUG) map.PrintOutputs();
+            if (MapReduceConc.DEBUG) map.PrintOutputs();
 
             for (String key : map.GetOutput().keySet())
             {
                 // Calcular a que reducer le corresponde está clave:
                 int r = Math.abs(key.hashCode())%Reducers.size();
 
-                if (MapReduce.DEBUG) System.err.println("DEBUG::MapReduce::Suffle merge key " + key +" to reduce " + r);
+                if (MapReduceConc.DEBUG) System.err.println("DEBUG::MapReduce::Suffle merge key " + key +" to reduce " + r);
 
                 // Añadir todas las tuplas de la clave al reducer correspondiente.
                 Reducers.get(r).AddInputKeys(key, map.GetOutput().get(key));
