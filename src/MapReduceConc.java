@@ -79,6 +79,7 @@ abstract class MapReduceConc extends MapReduce
 
 
     // Procesa diferentes fases del framework mapreduc: split, map, suffle/merge, reduce.
+    //PIPELINE TODO: Que se pueda solapar.
     @Override
     public Error Run()
     {
@@ -101,72 +102,107 @@ abstract class MapReduceConc extends MapReduce
     }
 
     // Procesa los ficheros de entrada para generar los diferentes split y posteriormente crea un mapper para procesarlos
-    // Versión Conc: asume que cada Map va a procesar un split.
+    // Versión Conc: asume que cada Map va a procesar un split y cada split tiene un fichero.
     private Error Split(String inputDir)
     {
-        Error cod;
+        List<Future<Error>> pending = new ArrayList<>();
+        Error firstError;
 
-        // Process input files
-        cod = ProcessInputFiles(inputDir);
-
-        if (cod==Error.COk)
+        try (ExecutorService pool = Executors.newVirtualThreadPerTaskExecutor())
         {
-            for (Split split : Splits) {
-                MapConc mapper = new MapConc(this, split);
-                AddMapper(mapper);
+            // Se recorre los directorios y se envia las lecturas el executador
+            firstError = ProcessInputFiles(inputDir, pool, pending);
+
+            // Espera a que terminen todas las lecturas.
+            for (Future<Error> future : pending)
+            {
+                try {
+                    Error result = future.get();
+
+                    if (result == Error.COk) {
+                        incProcessedFiles();
+                    }
+                    else if (firstError == Error.COk) {
+                        firstError = result;
+                    }
+                }
+                catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    pool.shutdownNow();
+                    return Error.CError;
+                }
+                catch (ExecutionException e) {
+                    e.getCause().printStackTrace();
+
+                    if (firstError == Error.COk) {
+                        firstError = Error.CError;
+                    }
+                }
             }
         }
-        return cod;
+
+        if (firstError != Error.COk) {
+            return firstError;
+        }
+
+        // Un mapper por cada split ya leído.
+        for (Split split : Splits) {
+            MapConc mapper = new MapConc(this, split);
+            AddMapper(mapper);
+        }
+
+        return Error.COk;
     }
 
     // Genera y lee diferentes splits: 1 split por fichero. Genera un vector con todos los splits generados.
     //Cambios a la version Concurrente: --> Se hace que cada Split tenga su arhivo, en la version secuencial se va añadiendo to en el mismo SPLIT.
-    private Error ProcessInputFiles(String input)
-    {
+    private Error ProcessInputFiles(String input, ExecutorService executor, List<Future<Error>> pending) {
         File folder = new File(input);
-
-        if (folder.isDirectory())
-        {
+        if (folder.isDirectory()) {
             File[] listOfFiles = folder.listFiles();
-
-            /* Read all the files and directories within directory */
-            for (int i = 0; i < listOfFiles.length; i++)
-            {
-                if (listOfFiles[i].isFile())
-                {
+            if (listOfFiles == null) {
+                return Error.CErrorOpenInputDir;
+            }
+            for (File file : listOfFiles) {
+                if (file.isFile()) {
                     Split split = new Split();
                     AddSplit(split);
+                    System.out.println("Processing input file " + file.getName() + ".");
 
-                    System.out.println("Processing input file " + listOfFiles[i].getName() + ".");
-
-                    incProcessedFiles();
-                    split.ReadFileTuples(listOfFiles[i].getAbsolutePath());
-                    split.AddInput(new MapInputTuple(-1, ""));
+                    // La lectura del fichero ocurre en una tarea virtual.
+                    pending.add(executor.submit(() -> {
+                        Error result = split.ReadFileTuples(file.getAbsolutePath());
+                        if (result == Error.COk) {
+                            split.AddInput(new MapInputTuple(-1, ""));
+                        }
+                        return result;
+                    }));
                 }
-                else if (listOfFiles[i].isDirectory()) {
-                    System.out.println("Directory " + listOfFiles[i].getName());
-
-                    Error result = ProcessInputFiles(listOfFiles[i].getAbsolutePath());
+                else if (file.isDirectory()) {
+                    System.out.println("Directory " + file.getName());
+                    Error result = ProcessInputFiles(file.getAbsolutePath(), executor, pending);
                     if (result != Error.COk) {
                         return result;
                     }
                 }
             }
         }
-        else //creacion si el split es solo un archivo
-        {
+        else if (folder.isFile()) {
             Split split = new Split();
             AddSplit(split);
-
             System.out.println("Processing input file " + folder.getName() + ".");
-            incProcessedFiles();
-
-            split.ReadFileTuples(folder.getAbsolutePath());
-            split.AddInput(new MapInputTuple(-1, ""));
+            pending.add(executor.submit(() -> {
+                Error result = split.ReadFileTuples(folder.getAbsolutePath());
+                if (result == Error.COk) {
+                    split.AddInput(new MapInputTuple(-1, ""));
+                }
+                return result;
+            }));
         }
-
-
-        return(Error.COk);
+        else {
+            return Error.CErrorOpenInputFile;
+        }
+        return Error.COk;
     }
 
 
@@ -231,7 +267,7 @@ abstract class MapReduceConc extends MapReduce
     }
 
 
-    public Error Map(Map map, MapInputTuple tuple)
+    public Error Map(MapConc map, MapInputTuple tuple)
     {
         System.err.println("MapReduce::Map -> ERROR map must be override.");
         return(Error.CError);
