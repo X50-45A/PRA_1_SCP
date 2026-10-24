@@ -280,26 +280,62 @@ abstract class MapReduceConc extends MapReduce
     // Utiliza un multimap para realizar la ordenación/unión.
     private Error Suffle()
     {
-        for(MapConc map : Mappers)
-        {
-            if (MapReduceConc.DEBUG) map.PrintOutputs();
-
-            for (String key : map.GetOutput().keySet())
-            {
-                // Calcular a que reducer le corresponde está clave:
-                int r = Math.abs(key.hashCode())%Reducers.size();
-
-                if (MapReduceConc.DEBUG) System.err.println("DEBUG::MapReduce::Suffle merge key " + key +" to reduce " + r);
-
-                // Añadir todas las tuplas de la clave al reducer correspondiente.
-                Reducers.get(r).AddInputKeys(key, map.GetOutput().get(key));
+        int numberOfReducers = Reducers.size();
+        ExecutorService pool = Executors.newFixedThreadPool(numberOfReducers);
+        List<Future<Error>> pending = new ArrayList<>();
+        Error firstError = Error.COk;
+        try {
+            for (int i = 0; i < numberOfReducers; i++) {
+                final int myReducerIndex = i;
+                Reduce myReducer = Reducers.get(i);
+                pending.add(pool.submit(() -> {
+                    for (MapConc map : Mappers) {
+                        for (String key : map.GetOutput().keySet()) {
+                            int assignedReducer = Math.floorMod(key.hashCode(), numberOfReducers);
+                            if (assignedReducer == myReducerIndex) {
+                                if (MapReduceConc.DEBUG) {
+                                    System.err.println("DEBUG::Suffle merge key " + key + " to reduce " + assignedReducer);
+                                }
+                                myReducer.AddInputKeys(
+                                        key, map.GetOutput().get(key));
+                            }
+                        }
+                    }
+                    return Error.COk;
+                }));
             }
-
-            // Eliminar todas las salidas.
+            for (Future<Error> future : pending) {
+                try {
+                    Error result = future.get();
+                    if (result != Error.COk && firstError == Error.COk) {
+                        firstError = result;
+                    }
+                }
+                catch (ExecutionException e) {
+                    e.getCause().printStackTrace();
+                    if (firstError == Error.COk) {
+                        firstError = Error.CError;
+                    }
+                }
+                catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    pool.shutdownNow();
+                    return Error.CError;
+                }
+            }
+        }
+        finally {
+            pool.shutdown();
+        }
+        if (firstError != Error.COk) {
+            return firstError;
+        }
+        // Limpia las salidas solo después de que todos los reducers las hayan leído.
+        for (MapConc map : Mappers) {
             map.GetOutput().clear();
         }
 
-        return(Error.COk);
+        return Error.COk;
     }
 
     // Ejecuta cada uno de los Reducers.
