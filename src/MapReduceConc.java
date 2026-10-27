@@ -8,7 +8,6 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
-import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
 
 
@@ -29,13 +28,13 @@ abstract class MapReduceConc extends MapReduce
 
     private Vector<Split> Splits =  new Vector<Split>();
     private Vector<MapConc> Mappers =  new Vector<MapConc>();
-    private Vector<Reduce> Reducers =  new Vector<Reduce>();
+    private Vector<ReduceConc> Reducers =  new Vector<ReduceConc>();
 
 
     // Set and Gets
     private void AddSplit(Split split) { Splits.add(split); }
     private void AddMapper(MapConc mapper) { Mappers.add(mapper); }
-    private void AddReduce(Reduce reducer) { Reducers.add(reducer); }
+    private void AddReduce(ReduceConc reducer) { Reducers.add(reducer); }
     public void SetInputPath(String path) {
         InputPath = path;
     }
@@ -72,7 +71,7 @@ abstract class MapReduceConc extends MapReduce
         DeleteOutputFiles();
 
         for(int x=0;x<NReducers;x++)
-            AddReduce(new Reduce(this, OutputFiles +".r"+(x+1)));
+            AddReduce(new ReduceConc(this, OutputFiles +".r"+(x+1)));
 
         return Error.COk;
     }
@@ -133,6 +132,7 @@ abstract class MapReduceConc extends MapReduce
                 }
                 catch (ExecutionException e) {
                     e.getCause().printStackTrace();
+
 
                     if (firstError == Error.COk) {
                         firstError = Error.CError;
@@ -221,11 +221,11 @@ abstract class MapReduceConc extends MapReduce
                         System.err.println("DEBUG::Running Map " + map);
                     }
 
-                    MappersRunning.incrementAndGet();
+
                     try {
                         return map.Run();
                     } finally {
-                        MappersRunning.decrementAndGet();
+
                     }
                 }));
             }
@@ -341,13 +341,52 @@ abstract class MapReduceConc extends MapReduce
     // Ejecuta cada uno de los Reducers.
     private Error Reduces()
     {
-        for(Reduce reduce : Reducers)
-        {
-            if (reduce.Run()!=Error.COk)
-                Error.showError("MapReduce::Reduce Run error.\n");
+        Thread[] threads = new Thread[Reducers.size()];
+        Error[] results = new Error[Reducers.size()];
+
+        for (int i = 0; i < Reducers.size(); i++) {
+            int reducerIndex = i;
+            ReduceConc reduce = Reducers.get(i);
+
+            threads[i] = new Thread(() -> {
+                try {
+                    results[reducerIndex] = reduce.Run();
+                } catch (RuntimeException e) {
+                    e.printStackTrace();
+                    results[reducerIndex] = Error.CError;
+                }
+            }, "Reduce-" + (i + 1));
+            threads[i].start();
         }
-        System.out.println("Reduccers han procesado "+DifferentWords+" palabras diferentes.");
-        return(Error.COk);
+
+        long totalDifferentWords = 0;
+        Error firstError = Error.COk;
+        boolean interrupted = false;
+
+        for (int i = 0; i < threads.length; i++) {
+            while (true) {
+                try {
+                    threads[i].join();
+                    break;
+                } catch (InterruptedException e) {
+                    // Esperamos a que todos los reducers terminen antes de devolver.
+                    interrupted = true;
+                }
+            }
+
+            totalDifferentWords += (Reducers.get(i)).getWordsEmitted();
+            if (results[i] != Error.COk && firstError == Error.COk) {
+                firstError = results[i];
+            }
+        }
+
+        DifferentWords = totalDifferentWords;
+        System.out.println("Reduccers han procesado " + totalDifferentWords + " palabras diferentes.");
+        if (interrupted) {
+            Thread.currentThread().interrupt();
+            return Error.CError;
+        }
+        return firstError;
     }
 
 

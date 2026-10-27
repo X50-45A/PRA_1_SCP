@@ -4,6 +4,7 @@ import java.util.List;
 import java.util.Vector;
 
 public class MapConc extends Map {
+
     long wordsEmitted = 0;
     public MapConc(MapReduce mapr, Split split) {
         super(mapr,split);
