@@ -8,6 +8,8 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.LinkedBlockingQueue;
 import java.util.stream.Collectors;
 
 
@@ -26,13 +28,19 @@ abstract class MapReduceConc extends MapReduce
     public int getProcessedFiles() { return ProcessedFiles; }
     public void incProcessedFiles() { ProcessedFiles++; }
 
-    private Vector<Split> Splits =  new Vector<Split>();
     private Vector<MapConc> Mappers =  new Vector<MapConc>();
     private Vector<ReduceConc> Reducers =  new Vector<ReduceConc>();
+    private List<BlockingQueue<ShuffleTuple>> ShuffleInputs = new ArrayList<>();
+    private List<Future<Error>> SplitTasks = new ArrayList<>();
+    private List<Future<Error>> MapTasks = new ArrayList<>();
+    private List<Future<Error>> ShuffleTasks = new ArrayList<>();
+    private ExecutorService SplitPool;
+    private ExecutorService MapPool;
+    private ExecutorService ShufflePool;
+    private boolean ShuffleEndSent;
 
 
     // Set and Gets
-    private void AddSplit(Split split) { Splits.add(split); }
     private void AddMapper(MapConc mapper) { Mappers.add(mapper); }
     private void AddReduce(ReduceConc reducer) { Reducers.add(reducer); }
     public void SetInputPath(String path) {
@@ -70,204 +78,211 @@ abstract class MapReduceConc extends MapReduce
         // Delete output reducer files
         DeleteOutputFiles();
 
+        Mappers.clear();
+        Reducers.clear();
+        ShuffleInputs.clear();
+        SplitTasks.clear();
+        MapTasks.clear();
+        ShuffleTasks.clear();
         for(int x=0;x<NReducers;x++)
+        {
             AddReduce(new ReduceConc(this, OutputFiles +".r"+(x+1)));
+            ShuffleInputs.add(new LinkedBlockingQueue<>());
+        }
 
         return Error.COk;
     }
 
 
-    // Procesa diferentes fases del framework mapreduc: split, map, suffle/merge, reduce.
-    //PIPELINE TODO: Que se pueda solapar.
+    // Orden de coordinación: iniciar Shuffle, programar Split, recoger Map,
+    // esperar Shuffle y ejecutar Reduce.
     @Override
     public Error Run()
     {
-        if (Init()!=Error.COk)
-            Error.showError("MapReduce::Run-Error Init");
+        Error initResult = Init();
+        if (initResult != Error.COk) return initResult;
 
-        if (Split(InputPath)!=Error.COk)
-            Error.showError("MapReduce::Run-Error Split");
-
-        if (Maps()!=Error.COk)
-            Error.showError("MapReduce::Run-Error Map");
-
-        if (Suffle()!=Error.COk)
-            Error.showError("MapReduce::Run-Error Merge");
-
-        if (Reduces()!=Error.COk)
-            Error.showError("MapReduce::Run-Error Reduce");
-
-        return(Error.COk);
-    }
-
-    // Procesa los ficheros de entrada para generar los diferentes split y posteriormente crea un mapper para procesarlos
-    // Versión Conc: asume que cada Map va a procesar un split y cada split tiene un fichero.
-    private Error Split(String inputDir)
-    {
-        List<Future<Error>> pending = new ArrayList<>();
-        Error firstError;
-
-        try (ExecutorService pool = Executors.newVirtualThreadPerTaskExecutor())
-        {
-            // Se recorre los directorios y se envia las lecturas el executador
-            firstError = ProcessInputFiles(inputDir, pool, pending);
-
-            // Espera a que terminen todas las lecturas.
-            for (Future<Error> future : pending)
-            {
-                try {
-                    Error result = future.get();
-
-                    if (result == Error.COk) {
-                        incProcessedFiles();
-                    }
-                    else if (firstError == Error.COk) {
-                        firstError = result;
-                    }
-                }
-                catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                    pool.shutdownNow();
-                    return Error.CError;
-                }
-                catch (ExecutionException e) {
-                    e.getCause().printStackTrace();
-
-
-                    if (firstError == Error.COk) {
-                        firstError = Error.CError;
-                    }
-                }
-            }
-        }
-
-        if (firstError != Error.COk) {
-            return firstError;
-        }
-
-        // Un mapper por cada split ya leído.
-        for (Split split : Splits) {
-            MapConc mapper = new MapConc(this, split);
-            AddMapper(mapper);
-        }
-
-        return Error.COk;
-    }
-
-    // Genera y lee diferentes splits: 1 split por fichero. Genera un vector con todos los splits generados.
-    //Cambios a la version Concurrente: --> Se hace que cada Split tenga su arhivo, en la version secuencial se va añadiendo to en el mismo SPLIT.
-    private Error ProcessInputFiles(String input, ExecutorService executor, List<Future<Error>> pending) {
-        File folder = new File(input);
-        if (folder.isDirectory()) {
-            File[] listOfFiles = folder.listFiles();
-            if (listOfFiles == null) {
-                return Error.CErrorOpenInputDir;
-            }
-            for (File file : listOfFiles) {
-                if (file.isFile()) {
-                    Split split = new Split();
-                    AddSplit(split);
-                    System.out.println("Processing input file " + file.getName() + ".");
-
-                    // La lectura del fichero ocurre en una tarea virtual.
-                    pending.add(executor.submit(() -> {
-                        Error result = split.ReadFileTuples(file.getAbsolutePath());
-                        if (result == Error.COk) {
-                            split.AddInput(new MapInputTuple(-1, ""));
-                        }
-                        return result;
-                    }));
-                }
-                else if (file.isDirectory()) {
-                    System.out.println("Directory " + file.getName());
-                    Error result = ProcessInputFiles(file.getAbsolutePath(), executor, pending);
-                    if (result != Error.COk) {
-                        return result;
-                    }
-                }
-            }
-        }
-        else if (folder.isFile()) {
-            Split split = new Split();
-            AddSplit(split);
-            System.out.println("Processing input file " + folder.getName() + ".");
-            pending.add(executor.submit(() -> {
-                Error result = split.ReadFileTuples(folder.getAbsolutePath());
-                if (result == Error.COk) {
-                    split.AddInput(new MapInputTuple(-1, ""));
-                }
-                return result;
-            }));
-        }
-        else {
-            return Error.CErrorOpenInputFile;
-        }
-        return Error.COk;
-    }
-
-
-    // Ejecuta cada uno de los Maps.
-    private Error Maps()
-    {
-        long totalWords = 0;
+        SplitPool = Executors.newVirtualThreadPerTaskExecutor();
+        MapPool = Executors.newFixedThreadPool(NThreads);
+        ShufflePool = Executors.newFixedThreadPool(Reducers.size());
+        ShuffleEndSent = false;
         Error firstError = Error.COk;
 
-        ExecutorService pool = Executors.newFixedThreadPool(NThreads);
-        List<Future<Error>> pendiente = new ArrayList<>();
         try {
-            for (MapConc map : Mappers) {
-                pendiente.add(pool.submit(() -> {
-                    if (MapReduce.DEBUG) {
-                        System.err.println("DEBUG::Running Map " + map);
-                    }
-
-
-                    try {
-                        return map.Run();
-                    } finally {
-
-                    }
-                }));
-            }
-
-            for (int i = 0; i < pendiente.size(); i++) {
-                try {
-                    Error result = pendiente.get(i).get(); // espera a que termine este Map
-
-                    totalWords += Mappers.get(i).getWordsEmitted();
-
-                    if (result != Error.COk && firstError == Error.COk) {
-                        firstError = result;
-                    }
-                } catch (ExecutionException e) {
-                    e.getCause().printStackTrace();
-                    if (firstError == Error.COk) {
-                        firstError = Error.CError;
-                    }
-                    // Sigue recogiendo las demás tareas antes de salir.
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                    pool.shutdownNow();
-                    return Error.CError;
+            firstError = FirstError(firstError, StartShuffle());
+            firstError = FirstError(firstError, Split(InputPath));
+            firstError = FirstError(firstError, Maps());
+            if (Thread.currentThread().isInterrupted()) return Error.CError;
+            firstError = FirstError(firstError, Suffle());
+            firstError = FirstError(firstError, Reduces());
+            return firstError;
+        } finally {
+            // No dejar consumidores Shuffle esperando si una fase falla antes.
+            if (!ShuffleEndSent && !Thread.currentThread().isInterrupted()) {
+                for (BlockingQueue<ShuffleTuple> queue : ShuffleInputs) {
+                    queue.add(ShuffleTuple.endOfStream());
                 }
             }
-
-            if (firstError != Error.COk) {
-                return firstError;
-            }
-
-            System.out.println("\nMappers han procesado un total de "
-                    + totalWords + " palabras.");
-
-            return Error.COk;
-
-        } finally {
-            pool.shutdown();
+            SplitPool.shutdownNow();
+            MapPool.shutdownNow();
+            ShufflePool.shutdownNow();
         }
     }
 
+    // ---------- Inicio de la fase Shuffle ----------
+    // Arranca sus consumidores antes de que Maps publique resultados.
+    private Error StartShuffle() {
+        try {
+            for (int i = 0; i < Reducers.size(); i++) {
+                final int reducerIndex = i;
+                ShuffleTasks.add(ShufflePool.submit(() -> RunShuffle(reducerIndex)));
+            }
+            return Error.COk;
+        } catch (RuntimeException e) {
+            e.printStackTrace();
+            return Error.CError;
+        }
+    }
 
-    public Error Map(MapConc map, MapInputTuple tuple)
+    // ---------- Fase Split ----------
+    // Programa las lecturas y sus Maps; vuelve sin esperar a que acaben.
+    private Error Split(String inputDir) {
+        return ProcessInputFiles(inputDir, SplitPool, MapPool, SplitTasks, MapTasks);
+    }
+
+    // Ayudante de Split: recorre directorios y programa un productor/mapper por fichero.
+    private Error ProcessInputFiles(String input, ExecutorService splitExecutor, ExecutorService mapExecutor, List<Future<Error>> splitTasks, List<Future<Error>> mapTasks) {
+        File folder = new File(input);
+        if (folder.isDirectory()) {
+            File[] files = folder.listFiles();
+            if (files == null) return Error.CErrorOpenInputDir;
+
+            Error firstError = Error.COk;
+            for (File file : files) {
+                Error result;
+                if (file.isFile()) {
+                    result = ScheduleFile(file, splitExecutor, mapExecutor, splitTasks, mapTasks);
+                } else if (file.isDirectory()) {
+                    System.out.println("Directory " + file.getName());
+                    result = ProcessInputFiles(file.getAbsolutePath(), splitExecutor, mapExecutor, splitTasks, mapTasks);
+                } else {
+                    continue;
+                }
+                firstError = FirstError(firstError, result);
+            }
+            return firstError;
+        }
+        if (folder.isFile()) {
+            return ScheduleFile(folder, splitExecutor, mapExecutor, splitTasks, mapTasks);
+        }
+        return Error.CErrorOpenInputFile;
+    }
+
+    // Programa el lector virtual y el Map limitado para el mismo SplitConc.
+    private Error ScheduleFile(File file, ExecutorService splitExecutor, ExecutorService mapExecutor, List<Future<Error>> splitTasks, List<Future<Error>> mapTasks) {
+        SplitConc split = new SplitConc();
+        MapConc mapper = new MapConc(this, split, ShuffleInputs);
+        AddMapper(mapper);
+        System.out.println("Processing input file " + file.getName() + ".");
+
+        // Executors distintos: un Map esperando datos no bloquea al lector.
+        splitTasks.add(splitExecutor.submit(() -> split.ReadFileTuples(file.getAbsolutePath())));
+        mapTasks.add(mapExecutor.submit(() -> {
+            if (DEBUG) System.err.println("DEBUG::Running Map " + mapper);
+            return mapper.Run();
+        }));
+        return Error.COk;
+    }
+
+    // ---------- Fase Map ----------
+    // Espera a Split y Map; después, el hilo principal cierra las entradas Shuffle.
+    private Error Maps() {
+        Error firstError = Error.COk;
+        for (Future<Error> task : SplitTasks) {
+            try {
+                Error result = task.get();
+                if (result == Error.COk) incProcessedFiles();
+                firstError = FirstError(firstError, result);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return Error.CError;
+            } catch (ExecutionException e) {
+                e.getCause().printStackTrace();
+                firstError = FirstError(firstError, Error.CError);
+            }
+        }
+
+        long totalWords = 0;
+        for (int i = 0; i < MapTasks.size(); i++) {
+            try {
+                firstError = FirstError(firstError, MapTasks.get(i).get());
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return Error.CError;
+            } catch (ExecutionException e) {
+                e.getCause().printStackTrace();
+                firstError = FirstError(firstError, Error.CError);
+            }
+            totalWords += Mappers.get(i).getWordsEmitted();
+        }
+        TotalWords = totalWords;
+        System.out.println("\nMappers han procesado un total de " + totalWords + " palabras.");
+
+        for (BlockingQueue<ShuffleTuple> queue : ShuffleInputs) {
+            queue.add(ShuffleTuple.endOfStream());
+        }
+        ShuffleEndSent = true;
+        return firstError;
+    }
+
+    // ---------- Fase Shuffle ----------
+    // Espera resultados: los consumidores ya han trabajado junto con Map.
+    private Error Suffle() {
+        Error firstError = Error.COk;
+        for (Future<Error> task : ShuffleTasks) {
+            try {
+                firstError = FirstError(firstError, task.get());
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return Error.CError;
+            } catch (ExecutionException e) {
+                e.getCause().printStackTrace();
+                firstError = FirstError(firstError, Error.CError);
+            }
+        }
+        return firstError;
+    }
+
+    // Consumidor de una cola: agrega valores solo al reducer que le pertenece.
+    private Error RunShuffle(int reducerIndex) {
+        BlockingQueue<ShuffleTuple> queue = ShuffleInputs.get(reducerIndex);
+        ReduceConc reducer = Reducers.get(reducerIndex);
+        try {
+            while (true) {
+                ShuffleTuple tuple = queue.take();
+                if (tuple.end()) return Error.COk;
+                if (DEBUG) {
+                    System.err.println("DEBUG::Suffle merge key " + tuple.key()
+                            + " to reduce " + reducerIndex);
+                }
+                reducer.AddInputKeys(tuple.key(), List.of(tuple.value()));
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return Error.CError;
+        } catch (RuntimeException e) {
+            e.printStackTrace();
+            return Error.CError;
+        }
+    }
+
+    // Conserva el primer error encontrado al recoger las tareas.
+    private static Error FirstError(Error current, Error candidate) {
+        return current == Error.COk ? candidate : current;
+    }
+
+
+    public Error Map(Map map, MapInputTuple tuple)
     {
         System.err.println("MapReduce::Map -> ERROR map must be override.");
         return(Error.CError);
@@ -275,70 +290,8 @@ abstract class MapReduceConc extends MapReduce
 
 
 
-    // Ordena y junta todas las tuplas de salida de los maps. Utiliza una función de hash como
-    // función de partición, para distribuir las claves entre los posibles reducers.
-    // Utiliza un multimap para realizar la ordenación/unión.
-    private Error Suffle()
-    {
-        int numberOfReducers = Reducers.size();
-        ExecutorService pool = Executors.newFixedThreadPool(numberOfReducers);
-        List<Future<Error>> pending = new ArrayList<>();
-        Error firstError = Error.COk;
-        try {
-            for (int i = 0; i < numberOfReducers; i++) {
-                final int myReducerIndex = i;
-                Reduce myReducer = Reducers.get(i);
-                pending.add(pool.submit(() -> {
-                    for (MapConc map : Mappers) {
-                        for (String key : map.GetOutput().keySet()) {
-                            int assignedReducer = Math.floorMod(key.hashCode(), numberOfReducers);
-                            if (assignedReducer == myReducerIndex) {
-                                if (MapReduceConc.DEBUG) {
-                                    System.err.println("DEBUG::Suffle merge key " + key + " to reduce " + assignedReducer);
-                                }
-                                myReducer.AddInputKeys(
-                                        key, map.GetOutput().get(key));
-                            }
-                        }
-                    }
-                    return Error.COk;
-                }));
-            }
-            for (Future<Error> future : pending) {
-                try {
-                    Error result = future.get();
-                    if (result != Error.COk && firstError == Error.COk) {
-                        firstError = result;
-                    }
-                }
-                catch (ExecutionException e) {
-                    e.getCause().printStackTrace();
-                    if (firstError == Error.COk) {
-                        firstError = Error.CError;
-                    }
-                }
-                catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                    pool.shutdownNow();
-                    return Error.CError;
-                }
-            }
-        }
-        finally {
-            pool.shutdown();
-        }
-        if (firstError != Error.COk) {
-            return firstError;
-        }
-        // Limpia las salidas solo después de que todos los reducers las hayan leído.
-        for (MapConc map : Mappers) {
-            map.GetOutput().clear();
-        }
-
-        return Error.COk;
-    }
-
-    // Ejecuta cada uno de los Reducers.
+    // ---------- Fase Reduce ----------
+    // Ejecuta cada reducer en un hilo propio y espera a todos con join().
     private Error Reduces()
     {
         Thread[] threads = new Thread[Reducers.size()];
