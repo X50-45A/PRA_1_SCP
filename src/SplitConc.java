@@ -1,3 +1,11 @@
+/* ---------------------------------------------------------------
+Práctica 1.
+Código fuente: SplitConc.java
+Grau Informàtica
+NIF [pendiente] y nombre completo autor1: Augustin-Dragos Belu.
+NIF [pendiente] y nombre completo autor2: Abraham Ruíz Monsteirin.
+--------------------------------------------------------------- */
+
 import java.io.BufferedReader;
 import java.io.FileInputStream;
 import java.io.FileNotFoundException;

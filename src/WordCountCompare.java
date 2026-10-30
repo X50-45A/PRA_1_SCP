@@ -1,3 +1,11 @@
+/* ---------------------------------------------------------------
+Práctica 1.
+Código fuente: WordCountCompare.java
+Grau Informàtica
+NIF [pendiente] y nombre completo autor1: Augustin-Dragos Belu.
+NIF [pendiente] y nombre completo autor2: Abraham Ruíz Monsteirin.
+--------------------------------------------------------------- */
+
 import java.text.DecimalFormat;
 import java.io.IOException;
 import java.nio.file.Files;

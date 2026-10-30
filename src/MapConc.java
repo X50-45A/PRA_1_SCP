@@ -1,3 +1,11 @@
+/* ---------------------------------------------------------------
+Práctica 1.
+Código fuente: MapConc.java
+Grau Informàtica
+NIF [pendiente] y nombre completo autor1: Augustin-Dragos Belu.
+NIF [pendiente] y nombre completo autor2: Abraham Ruíz Monsteirin.
+--------------------------------------------------------------- */
+
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.BlockingQueue;

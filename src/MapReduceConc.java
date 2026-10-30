@@ -1,3 +1,11 @@
+/* ---------------------------------------------------------------
+Práctica 1.
+Código fuente: MapReduceConc.java
+Grau Informàtica
+NIF [pendiente] y nombre completo autor1: Augustin-Dragos Belu.
+NIF [pendiente] y nombre completo autor2: Abraham Ruíz Monsteirin.
+--------------------------------------------------------------- */
+
 import java.io.File;
 import java.util.Collection;
 import java.util.Vector;
